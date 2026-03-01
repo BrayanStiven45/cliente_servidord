@@ -241,7 +241,7 @@ class CBNN:
             self.averageParameters()
             self.loss_history.append(np.mean(losses))
 
-            p#rint(f"Epoch {epoch+1}/{self.n_iter} - "
+            #rint(f"Epoch {epoch+1}/{self.n_iter} - "
               #    f"Loss: {self.loss_history[-1]:.4f}")
 
         # Señal de cierre

@@ -1,5 +1,6 @@
-#Inicializa cada proceso con el dataset total
-# y solo procesa los batches que se le fueron asignados
+# Inicializa cada proceso con el dataset total
+# y solo procesa el batch que se le fue asignado
+# n_batches == n_processes
 
 import numpy as np
 import multiprocessing as mp
@@ -29,9 +30,7 @@ def train_multiple_batches(args):
 
     global GLOBAL_BATCH_DATA, GLOBAL_BATCH_TARGETS
 
-    (batch_indices,
-     batch_params,
-     lr) = args
+    batch_indices, batch_params, lr = args
 
     updated_params = []
     losses = []
@@ -50,7 +49,7 @@ def train_multiple_batches(args):
 
         m = x_batch.shape[0]
 
-        # ------------------ Forward ------------------
+        # -------- Forward --------
 
         z1 = x_batch.dot(ws1.T) + bs1
         a1 = np.maximum(0, z1)
@@ -63,7 +62,7 @@ def train_multiple_batches(args):
         loss = -np.sum(y_batch * np.log(np.clip(a2, 1e-15, 1))) / m
         losses.append(loss)
 
-        # ------------------ Backward ------------------
+        # -------- Backward --------
 
         dz2 = a2 - y_batch
         dw2 = a1.T.dot(dz2)
@@ -96,16 +95,18 @@ def train_multiple_batches(args):
 class CBNN:
 
     def __init__(self, x_train, targets, n_iter, n_hidden,
-                 lr=0.1, n_batches=5):
+                 lr=0.1, n_batches=2):
 
         self.x_train = np.array(x_train)
         self.targets = np.array(targets)
         self.n_iter = n_iter
         self.hidden_layers = n_hidden
         self.lr = lr
-        self.n_batches = n_batches
-        self.loss_history = []
 
+        # 🔥 Clave: n_batches definido aquí
+        self.n_batches = n_batches
+
+        self.loss_history = []
         self.y_labels = np.argmax(self.targets, axis=1)
 
         self.initializeWeightsBias(n_hidden)
@@ -130,19 +131,15 @@ class CBNN:
 
     def initializeBatchParameters(self, n_hidden):
 
-        input_size = self.x_train.shape[1]
-        output_size = self.targets.shape[1]
-
         self.batch_params = []
 
         for _ in range(self.n_batches):
-            params = {
+            self.batch_params.append({
                 'ws1': self.ws1.copy(),
                 'bs1': self.bs1.copy(),
                 'ws2': self.ws2.copy(),
                 'bs2': self.bs2.copy()
-            }
-            self.batch_params.append(params)
+            })
 
     # ----------------------------------------------------
 
@@ -154,8 +151,10 @@ class CBNN:
         batch_data = []
         batch_targets = []
 
-        class_indices = [np.where(self.y_labels == c)[0]
-                         for c in range(n_classes)]
+        class_indices = [
+            np.where(self.y_labels == c)[0]
+            for c in range(n_classes)
+        ]
 
         for indices in class_indices:
             np.random.shuffle(indices)
@@ -207,6 +206,11 @@ class CBNN:
 
     def training_parallel(self, n_processes):
 
+        if n_processes != self.n_batches:
+            raise ValueError(
+                "n_processes debe ser igual a n_batches."
+            )
+
         start_time = time.perf_counter()
 
         pool = mp.Pool(
@@ -217,29 +221,23 @@ class CBNN:
 
         for epoch in range(self.n_iter):
 
-            indices = list(range(self.n_batches))
-            split_indices = np.array_split(indices, n_processes)
-
             args = [
                 (
-                    chunk,
+                    [idx],                # un batch por proceso
                     self.batch_params,
                     self.lr
                 )
-                for chunk in split_indices
+                for idx in range(self.n_batches)
             ]
 
             results = pool.map(train_multiple_batches, args)
 
-            new_params = []
+            self.batch_params = []
             epoch_losses = []
 
             for updated_list, loss in results:
-                new_params.extend(updated_list)
+                self.batch_params.extend(updated_list)
                 epoch_losses.append(loss)
-
-            for i in range(self.n_batches):
-                self.batch_params[i] = new_params[i]
 
             self.averageParameters()
             self.loss_history.append(np.mean(epoch_losses))
@@ -300,40 +298,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Entrenamiento CBNN paralelo")
 
-    parser.add_argument(
-        "--processes",
-        type=int,
-        default=2,
-        help="Cantidad de procesos paralelos"
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=25,
-        help="Cantidad de epochs"
-    )
-
-    parser.add_argument(
-        "--hidden",
-        type=int,
-        default=50,
-        help="Número de neuronas ocultas"
-    )
-
-    parser.add_argument(
-        "--batches",
-        type=int,
-        default=5,
-        help="Cantidad de batches"
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.05,
-        help="Learning rate"
-    )
+    parser.add_argument("--processes", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--hidden", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=0.05)
 
     args = parser.parse_args()
 
@@ -350,7 +318,7 @@ if __name__ == "__main__":
         n_iter=args.epochs,
         n_hidden=args.hidden,
         lr=args.lr,
-        n_batches=args.batches
+        n_batches=args.processes   # 🔥 Consistencia total
     )
 
     model.training_parallel(n_processes=args.processes)
