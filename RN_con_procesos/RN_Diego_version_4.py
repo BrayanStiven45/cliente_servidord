@@ -298,6 +298,47 @@ def evaluate_accuracy(model, x_test, y_test):
 
 if __name__ == "__main__":
 
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Entrenamiento CBNN paralelo")
+
+    parser.add_argument(
+        "--processes",
+        type=int,
+        default=2,
+        help="Cantidad de procesos paralelos"
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=25,
+        help="Cantidad de epochs"
+    )
+
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        default=50,
+        help="Número de neuronas ocultas"
+    )
+
+    parser.add_argument(
+        "--batches",
+        type=int,
+        default=5,
+        help="Cantidad de batches"
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=0.05,
+        help="Learning rate"
+    )
+
+    args = parser.parse_args()
+
     X, Y = load_mnist()
 
     x_train = X[:60000]
@@ -305,10 +346,18 @@ if __name__ == "__main__":
     x_test = X[60000:70000]
     y_test = Y[60000:70000]
 
-    print("Entrenando con 2 procesos")
+    model = CBNN(
+        x_train,
+        y_train,
+        n_iter=args.epochs,
+        n_hidden=args.hidden,
+        lr=args.lr,
+        n_batches=args.processes
+    )
 
-    model = CBNN(x_train, y_train, 25, 50, lr=0.05, n_batches=5)
-    model.training_parallel(n_processes=2)
+    model.training_parallel(n_processes=args.processes)
 
     acc = evaluate_accuracy(model, x_test, y_test)
-    print(f"Accuracy final: {acc:.4f}")
+    print(f"\nAccuracy final: {acc:.4f}")
+
+
