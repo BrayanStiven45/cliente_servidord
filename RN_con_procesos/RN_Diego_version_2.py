@@ -1,9 +1,7 @@
-#Inicializa cada proceso con el dataset total
-# y solo procesa los batches que se le fueron asignados
-
 import numpy as np
 import multiprocessing as mp
 import time
+import os
 from sklearn.datasets import fetch_openml
 
 
@@ -29,9 +27,7 @@ def train_multiple_batches(args):
 
     global GLOBAL_BATCH_DATA, GLOBAL_BATCH_TARGETS
 
-    (batch_indices,
-     batch_params,
-     lr) = args
+    batch_indices, batch_params, lr = args
 
     updated_params = []
     losses = []
@@ -50,8 +46,7 @@ def train_multiple_batches(args):
 
         m = x_batch.shape[0]
 
-        # ------------------ Forward ------------------
-
+        # Forward
         z1 = x_batch.dot(ws1.T) + bs1
         a1 = np.maximum(0, z1)
 
@@ -63,8 +58,7 @@ def train_multiple_batches(args):
         loss = -np.sum(y_batch * np.log(np.clip(a2, 1e-15, 1))) / m
         losses.append(loss)
 
-        # ------------------ Backward ------------------
-
+        # Backward
         dz2 = a2 - y_batch
         dw2 = a1.T.dot(dz2)
         db2 = np.sum(dz2, axis=0, keepdims=True)
@@ -96,7 +90,7 @@ def train_multiple_batches(args):
 class CBNN:
 
     def __init__(self, x_train, targets, n_iter, n_hidden,
-                 lr=0.1, n_batches=5):
+                 lr=0.1, n_batches=2):
 
         self.x_train = np.array(x_train)
         self.targets = np.array(targets)
@@ -104,17 +98,13 @@ class CBNN:
         self.hidden_layers = n_hidden
         self.lr = lr
         self.n_batches = n_batches
-        self.loss_history = []
 
+        self.loss_history = []
         self.y_labels = np.argmax(self.targets, axis=1)
 
         self.initializeWeightsBias(n_hidden)
-        self.initializeBatchParameters(n_hidden)
-
-        self.batch_data, self.batch_targets = \
-            self.createClassBalancedBatches()
-
-    # ----------------------------------------------------
+        self.initializeBatchParameters()
+        self.batch_data, self.batch_targets = self.createClassBalancedBatches()
 
     def initializeWeightsBias(self, n_hidden):
 
@@ -126,25 +116,16 @@ class CBNN:
         self.ws2 = np.random.randn(output_size, n_hidden) * np.sqrt(2. / n_hidden)
         self.bs2 = np.zeros((1, output_size))
 
-    # ----------------------------------------------------
-
-    def initializeBatchParameters(self, n_hidden):
-
-        input_size = self.x_train.shape[1]
-        output_size = self.targets.shape[1]
+    def initializeBatchParameters(self):
 
         self.batch_params = []
-
         for _ in range(self.n_batches):
-            params = {
+            self.batch_params.append({
                 'ws1': self.ws1.copy(),
                 'bs1': self.bs1.copy(),
                 'ws2': self.ws2.copy(),
                 'bs2': self.bs2.copy()
-            }
-            self.batch_params.append(params)
-
-    # ----------------------------------------------------
+            })
 
     def createClassBalancedBatches(self):
 
@@ -154,8 +135,10 @@ class CBNN:
         batch_data = []
         batch_targets = []
 
-        class_indices = [np.where(self.y_labels == c)[0]
-                         for c in range(n_classes)]
+        class_indices = [
+            np.where(self.y_labels == c)[0]
+            for c in range(n_classes)
+        ]
 
         for indices in class_indices:
             np.random.shuffle(indices)
@@ -176,8 +159,6 @@ class CBNN:
             batch_targets.append(self.targets[batch_indices])
 
         return batch_data, batch_targets
-
-    # ----------------------------------------------------
 
     def averageParameters(self):
 
@@ -203,9 +184,10 @@ class CBNN:
             params['ws2'] = self.ws2.copy()
             params['bs2'] = self.bs2.copy()
 
-    # ----------------------------------------------------
-
     def training_parallel(self, n_processes):
+
+        if n_processes != self.n_batches:
+            raise ValueError("n_processes debe ser igual a n_batches.")
 
         start_time = time.perf_counter()
 
@@ -217,29 +199,19 @@ class CBNN:
 
         for epoch in range(self.n_iter):
 
-            indices = list(range(self.n_batches))
-            split_indices = np.array_split(indices, n_processes)
-
             args = [
-                (
-                    chunk,
-                    self.batch_params,
-                    self.lr
-                )
-                for chunk in split_indices
+                ([idx], self.batch_params, self.lr)
+                for idx in range(self.n_batches)
             ]
 
             results = pool.map(train_multiple_batches, args)
 
-            new_params = []
+            self.batch_params = []
             epoch_losses = []
 
             for updated_list, loss in results:
-                new_params.extend(updated_list)
+                self.batch_params.extend(updated_list)
                 epoch_losses.append(loss)
-
-            for i in range(self.n_batches):
-                self.batch_params[i] = new_params[i]
 
             self.averageParameters()
             self.loss_history.append(np.mean(epoch_losses))
@@ -248,9 +220,7 @@ class CBNN:
         pool.join()
 
         wall_time = time.perf_counter() - start_time
-        print(f"Wall time total: {wall_time:.4f} segundos")
-
-    # ----------------------------------------------------
+        return wall_time
 
     def predict(self, x):
 
@@ -264,12 +234,16 @@ class CBNN:
 
 
 # =========================================================
-# UTILIDADES
+# DATASET OPTIMIZADO
 # =========================================================
 
-def load_mnist():
+def load_mnist_cached():
 
-    print("Loading MNIST...")
+    if os.path.exists("mnist_X.npy") and os.path.exists("mnist_Y.npy"):
+        X = np.load("mnist_X.npy")
+        Y = np.load("mnist_Y.npy")
+        return X, Y
+
     mnist = fetch_openml("mnist_784", version=1, as_frame=False)
 
     X = mnist.data.astype(np.float32) / 255.0
@@ -277,6 +251,9 @@ def load_mnist():
 
     one_hot = np.zeros((y.size, 10))
     one_hot[np.arange(y.size), y] = 1
+
+    np.save("mnist_X.npy", X)
+    np.save("mnist_Y.npy", one_hot)
 
     return X, one_hot
 
@@ -298,46 +275,15 @@ if __name__ == "__main__":
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="Entrenamiento CBNN paralelo")
-
-    parser.add_argument(
-        "--processes",
-        type=int,
-        default=2,
-        help="Cantidad de procesos paralelos"
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=25,
-        help="Cantidad de epochs"
-    )
-
-    parser.add_argument(
-        "--hidden",
-        type=int,
-        default=50,
-        help="Número de neuronas ocultas"
-    )
-
-    parser.add_argument(
-        "--batches",
-        type=int,
-        default=5,
-        help="Cantidad de batches"
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.05,
-        help="Learning rate"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--processes", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=600)
+    parser.add_argument("--hidden", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=0.05)
 
     args = parser.parse_args()
 
-    X, Y = load_mnist()
+    X, Y = load_mnist_cached()
 
     x_train = X[:60000]
     y_train = Y[:60000]
@@ -350,10 +296,12 @@ if __name__ == "__main__":
         n_iter=args.epochs,
         n_hidden=args.hidden,
         lr=args.lr,
-        n_batches=args.batches
+        n_batches=args.processes
     )
 
-    model.training_parallel(n_processes=args.processes)
+    wall_time = model.training_parallel(n_processes=args.processes)
 
     acc = evaluate_accuracy(model, x_test, y_test)
-    print(f"\nAccuracy final: {acc:.4f}")
+
+    print(f"time={wall_time:.6f}")
+    print(f"accuracy={acc:.6f}")

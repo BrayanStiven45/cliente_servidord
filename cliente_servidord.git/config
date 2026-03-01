@@ -1,0 +1,9 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[remote "origin"]
+	url = https://github.com/BrayanStiven45/cliente_servidord.git
+	tagOpt = --no-tags
+	fetch = +refs/*:refs/*
+	mirror = true

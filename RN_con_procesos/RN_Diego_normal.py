@@ -262,27 +262,23 @@ def evaluate_accuracy(model, x_test, y_test):
 
     return np.mean(predicted_labels == true_labels)
 
-def train_in_blocks(model, x_test, y_test, total_epochs=900, block_size=50):
-
-    epochs_done = 0
+def train_in_blocks(model, x_test, y_test, total_epochs=900):
     accuracies = []
     epoch_points = []
 
     start_time = time.perf_counter()
-    model.training()  # ejecuta 50 épocas (definidas en el constructor)
+    model.training() 
 
     wall_time = time.perf_counter() - start_time
     print(f"Wall time total: {wall_time:.4f} segundos")
 
     acc = evaluate_accuracy(model, x_test, y_test)
 
-    epoch_points.append(epochs_done)
-
-    print(f"Accuracy after {epochs_done} epochs: {acc:.4f}")
+    print(f"Accuracy after {total_epochs} epochs: {acc:.4f}")
 
     return epoch_points, accuracies
 
-def compare_models_progressive(n_epochs=300, n_hidden=50, lr=0.05, n_batches=5, n_iter=50):
+def compare_models_progressive(n_epochs=300, n_hidden=50, lr=0.05, n_batches=5):
 
     print("="*60)
     print("LOADING MNIST")
@@ -307,7 +303,7 @@ def compare_models_progressive(n_epochs=300, n_hidden=50, lr=0.05, n_batches=5, 
     model_diego = RN_DIEGO(
         x_train=x_train,
         targets=y_train,
-        n_iter=n_iter, 
+        n_iter=n_epochs, 
         n_hidden=n_hidden,
         lr=lr,
         n_batches=n_batches
@@ -317,8 +313,7 @@ def compare_models_progressive(n_epochs=300, n_hidden=50, lr=0.05, n_batches=5, 
         model_diego,
         x_test,
         y_test,
-        total_epochs=n_epochs,
-        block_size=n_iter
+        total_epochs=n_epochs
     )
 
 if __name__ == "__main__":
@@ -327,7 +322,6 @@ if __name__ == "__main__":
         n_epochs=25,
         n_hidden=50,
         lr=0.05,
-        n_batches=5,
-        n_iter=25
+        n_batches=5
     )
     
