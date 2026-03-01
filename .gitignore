@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+RN_con_procesos/mnist_X.npy
+RN_con_procesos/mnist_Y.npy
