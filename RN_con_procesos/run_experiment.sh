@@ -22,7 +22,7 @@ do
         echo "   Testing $p processes..."
 
         result=$(OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-                 python RN_Diego_version_2.py --processes $p)
+                 python RN_Diego_multiprocesing.py --processes $p)
 
         time=$(echo "$result" | grep -oP 'time=\K[0-9.]+')
         acc=$(echo "$result" | grep -oP 'accuracy=\K[0-9.]+')

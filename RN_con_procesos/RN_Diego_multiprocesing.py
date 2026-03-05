@@ -186,8 +186,8 @@ class CBNN:
 
     def training_parallel(self, n_processes):
 
-        if n_processes != self.n_batches:
-            raise ValueError("n_processes debe ser igual a n_batches.")
+        if n_processes > self.n_batches:
+            raise ValueError("No puede haber más procesos que batches.")
 
         start_time = time.perf_counter()
 
@@ -199,9 +199,28 @@ class CBNN:
 
         for epoch in range(self.n_iter):
 
+            # ==========================
+            # DISTRIBUCIÓN DE BATCHES
+            # ==========================
+            batch_indices = list(range(self.n_batches))
+
+            base = self.n_batches // n_processes
+            extra = self.n_batches % n_processes
+
+            distributed = []
+            start = 0
+
+            for i in range(n_processes):
+                size = base + (1 if i < extra else 0)
+                distributed.append(batch_indices[start:start+size])
+                start += size
+
+            # ==========================
+            # ARGUMENTOS PARA PROCESOS
+            # ==========================
             args = [
-                ([idx], self.batch_params, self.lr)
-                for idx in range(self.n_batches)
+                (indices, self.batch_params, self.lr)
+                for indices in distributed
             ]
 
             results = pool.map(train_multiple_batches, args)
@@ -280,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=600)
     parser.add_argument("--hidden", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--batches", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -290,15 +310,17 @@ if __name__ == "__main__":
     x_test = X[60000:70000]
     y_test = Y[60000:70000]
 
+    n_batches = args.batches if args.batches is not None else args.processes
+
     model = CBNN(
         x_train,
         y_train,
         n_iter=args.epochs,
         n_hidden=args.hidden,
         lr=args.lr,
-        n_batches=args.processes
+        n_batches=n_batches
     )
-
+    
     wall_time = model.training_parallel(n_processes=args.processes)
 
     acc = evaluate_accuracy(model, x_test, y_test)
