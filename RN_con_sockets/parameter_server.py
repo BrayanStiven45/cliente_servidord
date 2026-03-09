@@ -7,6 +7,8 @@ import pickle
 import struct
 import json
 import time
+import sys
+import select
 
 
 def send_json(sock, obj):
@@ -15,16 +17,22 @@ def send_json(sock, obj):
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-def recv_json(sock):
+def recv_json(sock, timeout=None):
     """Receive JSON message with length prefix."""
-    raw_len = recv_all(sock, 4)
-    if raw_len is None:
-        return None
-    msg_len = struct.unpack(">I", raw_len)[0]
-    data = recv_all(sock, msg_len)
-    if data is None:
-        return None
-    return json.loads(data.decode('utf-8'))
+    if timeout:
+        sock.settimeout(timeout)
+    try:
+        raw_len = recv_all(sock, 4)
+        if raw_len is None:
+            return None
+        msg_len = struct.unpack(">I", raw_len)[0]
+        data = recv_all(sock, msg_len)
+        if data is None:
+            return None
+        return json.loads(data.decode('utf-8'))
+    finally:
+        if timeout:
+            sock.settimeout(None)
 
 
 def send_arrays(sock, arrays):
@@ -33,16 +41,22 @@ def send_arrays(sock, arrays):
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
-def recv_arrays(sock):
+def recv_arrays(sock, timeout=None):
     """Receive numpy arrays using pickle."""
-    raw_len = recv_all(sock, 4)
-    if raw_len is None:
-        return None
-    msg_len = struct.unpack(">I", raw_len)[0]
-    data = recv_all(sock, msg_len)
-    if data is None:
-        return None
-    return pickle.loads(data)
+    if timeout:
+        sock.settimeout(timeout)
+    try:
+        raw_len = recv_all(sock, 4)
+        if raw_len is None:
+            return None
+        msg_len = struct.unpack(">I", raw_len)[0]
+        data = recv_all(sock, msg_len)
+        if data is None:
+            return None
+        return pickle.loads(data)
+    finally:
+        if timeout:
+            sock.settimeout(None)
 
 
 def recv_all(sock, n):
@@ -74,30 +88,30 @@ def load_mnist(train_size):
 
 class ParameterServer:
     def __init__(self, host, port, epochs,
-                 initial_batches, batch_increment,
-                 lr, hidden, train_size, eval_interval=25,
-                 min_workers=1):  # Added min_workers parameter
+                 n_batches, lr, hidden, train_size, 
+                 eval_interval=25, n_workers=3):
+        
         self.host = host
         self.port = port
         self.epochs = epochs
-        self.initial_batches = initial_batches
-        self.batch_increment = batch_increment
+        self.n_batches = n_batches
         self.lr = lr
         self.hidden = hidden
         self.train_size = train_size
         self.eval_interval = eval_interval
-        self.min_workers = min_workers  # Minimum workers to start training
+        
+        # Fixed number of workers for entire training
+        self.n_workers = n_workers
 
-        self.workers = []
+        self.workers = []  # List of (conn, addr, worker_id, assignments)
         self.lock = threading.Lock()
         self.ready_workers = 0
         self.ready_condition = threading.Condition(self.lock)
         self.training_started = False
-        self.training_done = False  # Flag to signal training completion
+        self.training_done = False
 
         # Dataset
         self.X_train, self.Y_train, self.y_train_raw = load_mnist(self.train_size)
-        self.n_batches = initial_batches
         self.create_batches(self.n_batches)
 
         # Model
@@ -116,20 +130,15 @@ class ParameterServer:
         self.batch_data = np.array_split(self.X_train, n_batches)
         self.batch_targets = np.array_split(self.Y_train, n_batches)
 
-    def rebalance(self):
-        n_workers = len(self.workers)
-        if n_workers > self.n_batches:
-            self.n_batches += self.batch_increment
-            print("Increasing batches:", self.n_batches)
-            self.create_batches(self.n_batches)
-
-        assignments = [[] for _ in range(n_workers)]
+    def create_assignments(self):
+        """Create fixed batch assignments for each worker."""
+        assignments = [[] for _ in range(self.n_workers)]
         for i in range(self.n_batches):
-            assignments[i % n_workers].append(i)
+            assignments[i % self.n_workers].append(i)
         return assignments
 
-    def send_dataset(self, conn):
-        """Send dataset as binary arrays first, then metadata as JSON."""
+    def send_dataset(self, conn, worker_id, assignments):
+        """Send dataset and worker-specific assignment."""
         arrays = {
             'batch_data': self.batch_data,
             'batch_targets': self.batch_targets,
@@ -139,7 +148,9 @@ class ParameterServer:
         send_json(conn, {
             "type": "dataset",
             "n_batches": self.n_batches,
-            "lr": self.lr
+            "lr": self.lr,
+            "worker_id": worker_id,
+            "assignments": assignments[worker_id]
         })
 
     def compute_accuracy(self, X=None, y=None):
@@ -156,18 +167,95 @@ class ParameterServer:
         accuracy = np.mean(predictions == y) * 100
         return accuracy
 
-    def training_loop(self):
-        print(f"Training thread waiting for {self.min_workers} worker(s)...")
+    def console_control(self):
+        """Console thread for status only."""
+        print(f"\n{'='*60}")
+        print(f"CONSOLE MONITOR")
+        print(f"Fixed workers: {self.n_workers}")
+        print(f"Batches: {self.n_batches} (fixed, no rebalancing)")
+        print(f"Commands:")
+        print(f"  status   - Show current worker count and status")
+        print(f"  help     - Show this help message")
+        print(f"{'='*60}\n")
         
-        # Wait for minimum number of workers to be ready
+        while not self.training_done:
+            try:
+                # Non-blocking input check
+                if sys.platform != 'win32':
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    if ready:
+                        line = sys.stdin.readline().strip()
+                    else:
+                        continue
+                else:
+                    time.sleep(0.5)
+                    continue
+                
+                if not line:
+                    continue
+                
+                parts = line.split()
+                cmd = parts[0].lower()
+                
+                if cmd == 'status':
+                    with self.lock:
+                        ready = self.ready_workers
+                        total = len(self.workers)
+                        started = self.training_started
+                        done = self.training_done
+                    
+                    print(f"\n--- STATUS ---")
+                    print(f"Target workers: {self.n_workers}")
+                    print(f"Ready workers:  {ready}")
+                    print(f"Total connected: {total}")
+                    print(f"Training started: {started}")
+                    print(f"Training done: {done}")
+                    if not started:
+                        print(f"Waiting for {max(0, self.n_workers - ready)} more workers")
+                    print(f"--------------\n")
+                
+                elif cmd == 'help':
+                    print(f"\nCommands:")
+                    print(f"  status   - Show current status")
+                    print(f"  help     - Show this help")
+                    print(f"")
+                
+                else:
+                    print(f"Unknown command: {line}")
+                    print(f"Type 'help' for available commands")
+                    
+            except EOFError:
+                break
+            except Exception as e:
+                print(f"Console error: {e}")
+
+    def training_loop(self):
+        """Training coordinator - fixed workers, no rebalancing."""
+        target = self.n_workers
+        
+        print(f"\n{'='*60}")
+        print(f"WAITING FOR {target} WORKERS")
+        print(f"Configuration: {self.n_batches} batches ÷ {target} workers = ~{self.n_batches//target} batches each")
+        print(f"{'='*60}\n")
+        
+        # Wait for exact number of workers
         with self.ready_condition:
-            while self.ready_workers < self.min_workers:
-                self.ready_condition.wait()
+            while self.ready_workers < target:
+                remaining = target - self.ready_workers
+                print(f"Waiting... {self.ready_workers}/{target} workers ready ({remaining} more needed)")
+                self.ready_condition.wait(timeout=2.0)
         
         self.training_started = True
+        
         print(f"\n{'='*60}")
-        print(f"STARTING TRAINING with {self.ready_workers} worker(s)")
+        print(f"STARTING TRAINING with {self.n_workers} worker(s)")
+        print(f"Fixed assignment for all {self.epochs} epochs")
         print(f"{'='*60}")
+        
+        # Create fixed assignments once
+        assignments = self.create_assignments()
+        for i, a in enumerate(assignments):
+            print(f"  Worker {i}: batches {a}")
         
         # Initial accuracy
         initial_acc = self.compute_accuracy()
@@ -182,36 +270,42 @@ class ParameterServer:
             with self.lock:
                 workers = list(self.workers)
 
-            assignments = self.rebalance()
+            if len(workers) == 0:
+                print("CRITICAL: All workers disconnected!")
+                break
 
-            # Send training commands as JSON
-            for i, conn in enumerate(workers):
+            # Send training commands with fixed assignments
+            for worker in workers:
+                conn, addr, worker_id, _ = worker
                 try:
                     send_json(conn, {
                         "type": "train",
-                        "batches": assignments[i],
-                        "lr": self.lr
+                        "batches": assignments[worker_id],
+                        "lr": self.lr,
+                        "epoch": epoch + 1
                     })
                 except Exception as e:
-                    print(f"Error sending train command to worker {i}: {e}")
+                    print(f"Error sending train command to worker {worker_id}: {e}")
 
-            # Send current weights as binary arrays
-            for i, conn in enumerate(workers):
+            # Send current weights
+            for worker in workers:
+                conn, addr, worker_id, _ = worker
                 try:
                     send_arrays(conn, (self.ws1, self.bs1, self.ws2, self.bs2))
                 except Exception as e:
-                    print(f"Error sending weights to worker {i}: {e}")
+                    print(f"Error sending weights to worker {worker_id}: {e}")
 
-            # Receive gradients as binary arrays
+            # Receive gradients
             grads = []
-            for i, conn in enumerate(workers):
+            for worker in workers:
+                conn, addr, worker_id, _ = worker
                 try:
-                    worker_grads = recv_arrays(conn)
+                    worker_grads = recv_arrays(conn, timeout=60.0)
                     if worker_grads is not None:
                         grads.extend(worker_grads)
-                        print(f"Received {len(worker_grads)} gradients from worker {i}")
+                        print(f"Received {len(worker_grads)} gradients from worker {worker_id}")
                 except Exception as e:
-                    print(f"Error receiving gradients from worker {i}: {e}")
+                    print(f"Error receiving gradients from worker {worker_id}: {e}")
 
             if not grads:
                 print("No gradients received, skipping update")
@@ -257,17 +351,19 @@ class ParameterServer:
         # Notify workers training is done
         with self.lock:
             workers = list(self.workers)
-        for conn in workers:
+        for worker in workers:
+            conn = worker[0]
             try:
                 send_json(conn, {"type": "done"})
+                conn.close()
             except:
                 pass
 
     def handle_worker(self, conn, addr):
         """Handle individual worker connection."""
-        print(f"Worker connected: {addr}")
+        print(f"\n>>> Worker connected: {addr}")
         
-        # Check if training already started - reject new workers
+        # Reject if training already started or too many workers
         with self.lock:
             if self.training_started:
                 print(f"Training already started, rejecting worker {addr}")
@@ -278,34 +374,48 @@ class ParameterServer:
                     pass
                 return
             
-            self.workers.append(conn)
-        
-        try:
-            # Send dataset immediately upon connection
-            self.send_dataset(conn)
-            print(f"Dataset sent to worker {addr}")
-            
-            # Wait for worker to confirm dataset received
-            response = recv_json(conn)
-            if response is None or response.get("status") != "ready":
-                print(f"Worker {addr} failed to acknowledge dataset")
-                with self.lock:
-                    if conn in self.workers:
-                        self.workers.remove(conn)
+            if len(self.workers) >= self.n_workers:
+                print(f"Already have {self.n_workers} workers, rejecting {addr}")
+                try:
+                    send_json(conn, {"type": "rejected", "reason": "worker_limit_reached"})
+                    conn.close()
+                except:
+                    pass
                 return
             
-            print(f"Worker {addr} is ready")
+            # Assign worker ID
+            worker_id = len(self.workers)
+            self.workers.append([conn, addr, worker_id, []])
+        
+        try:
+            # Create assignments and send to this worker
+            assignments = self.create_assignments()
+            self.send_dataset(conn, worker_id, assignments)
+            print(f"Dataset sent to worker {worker_id} ({addr}) - assigned batches: {assignments[worker_id]}")
+            
+            # Wait for ready acknowledgment
+            response = recv_json(conn, timeout=30.0)
+            if response is None or response.get("status") != "ready":
+                print(f"Worker {worker_id} failed to acknowledge")
+                with self.lock:
+                    self.workers = [w for w in self.workers if w[0] != conn]
+                return
+            
+            print(f"Worker {worker_id} ({addr}) is ready")
             
             # Signal that a worker is ready
             with self.ready_condition:
                 self.ready_workers += 1
                 current_ready = self.ready_workers
-                self.ready_condition.notify()
-            
-            print(f"Total ready workers: {current_ready}/{self.min_workers}")
-            
-            # Keep connection alive and handle communication during training
-            # Just wait here - training_loop handles the actual communication
+                
+                if current_ready >= self.n_workers:
+                    self.ready_condition.notify_all()
+                    print(f"\n*** ALL {self.n_workers} WORKERS READY! ***")
+                    print(f"*** STARTING TRAINING NOW! ***\n")
+                else:
+                    print(f"Progress: {current_ready}/{self.n_workers} workers ready")
+                
+            # Keep connection alive
             while not self.training_done:
                 time.sleep(0.1)
                 
@@ -313,8 +423,7 @@ class ParameterServer:
             print(f"Error handling worker {addr}: {e}")
         finally:
             with self.lock:
-                if conn in self.workers:
-                    self.workers.remove(conn)
+                self.workers = [w for w in self.workers if w[0] != conn]
                 if self.ready_workers > 0:
                     self.ready_workers -= 1
             try:
@@ -328,19 +437,32 @@ class ParameterServer:
         server.bind((self.host, self.port))
         server.listen()
 
+        print(f"\n{'='*60}")
         print(f"Parameter Server running on {self.host}:{self.port}")
-        print(f"Waiting for {self.min_workers} worker(s) to start training...")
+        print(f"Configuration:")
+        print(f"  Workers: {self.n_workers} (fixed)")
+        print(f"  Batches: {self.n_batches} (fixed, no rebalancing)")
+        print(f"  Epochs: {self.epochs}")
+        print(f"{'='*60}")
 
-        # Start training thread
+        # Start console monitor thread
+        threading.Thread(target=self.console_control, daemon=True).start()
+        
+        # Start training coordinator thread
         threading.Thread(target=self.training_loop, daemon=True).start()
 
-        while True:
+        # Accept connections until training starts
+        while not self.training_started:
             conn, addr = server.accept()
             threading.Thread(
                 target=self.handle_worker, 
                 args=(conn, addr), 
                 daemon=True
             ).start()
+        
+        # After training starts, stop accepting new connections
+        print("Training started, no longer accepting new workers")
+        server.close()
 
 
 # ==============================
@@ -348,28 +470,31 @@ class ParameterServer:
 # ==============================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Distributed Parameter Server")
+    parser = argparse.ArgumentParser(description="Fixed Worker Distributed Parameter Server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--initial_batches", type=int, default=4)
-    parser.add_argument("--batch_increment", type=int, default=2)
+    parser.add_argument("--n_batches", type=int, default=6,
+                       help="Total number of batches (fixed)")
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--hidden", type=int, default=50)
     parser.add_argument("--train_size", type=int, default=60000)
     parser.add_argument("--eval_interval", type=int, default=25, 
                        help="Evaluate accuracy every N epochs")
-    parser.add_argument("--min_workers", type=int, default=2,  # Default to 2 workers
-                       help="Minimum number of workers to start training")
+    parser.add_argument("--n_workers", type=int, default=3,
+                       help="Fixed number of workers for entire training")
 
     args = parser.parse_args()
 
     ps = ParameterServer(
-        host=args.host, port=args.port, epochs=args.epochs,
-        initial_batches=args.initial_batches, 
-        batch_increment=args.batch_increment,
-        lr=args.lr, hidden=args.hidden, train_size=args.train_size,
+        host=args.host, 
+        port=args.port, 
+        epochs=args.epochs,
+        n_batches=args.n_batches, 
+        lr=args.lr, 
+        hidden=args.hidden, 
+        train_size=args.train_size,
         eval_interval=args.eval_interval,
-        min_workers=args.min_workers
+        n_workers=args.n_workers
     )
     ps.start()
