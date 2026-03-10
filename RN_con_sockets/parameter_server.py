@@ -473,7 +473,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fixed Worker Distributed Parameter Server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=600)
     parser.add_argument("--n_batches", type=int, default=6,
                        help="Total number of batches (fixed)")
     parser.add_argument("--lr", type=float, default=0.05)
@@ -490,7 +490,7 @@ if __name__ == "__main__":
         host=args.host, 
         port=args.port, 
         epochs=args.epochs,
-        n_batches=args.n_batches, 
+        n_batches=args.n_workers, # La cantidad de batches sera igual a la cantidad de workers
         lr=args.lr, 
         hidden=args.hidden, 
         train_size=args.train_size,
