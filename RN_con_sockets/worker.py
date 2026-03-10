@@ -139,7 +139,13 @@ class Worker:
                         batches = msg["batches"]
                         lr = msg["lr"]
 
+                        # NEW: optional time measurement
+                        measure_time = msg.get("measure_time", False)
+
                         weights = recv_arrays(sock)
+
+                        if measure_time:
+                            start = time.time()
 
                         grads = train_multiple_batches(
                             batch_data,
@@ -148,6 +154,15 @@ class Worker:
                             weights,
                             lr
                         )
+
+                        if measure_time:
+                            end = time.time()
+                            elapsed = end - start
+
+                            send_json(sock, {
+                                "type": "worker_time",
+                                "time": elapsed
+                            })
 
                         send_arrays(sock, grads)
 
