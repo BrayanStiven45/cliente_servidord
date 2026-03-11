@@ -7,248 +7,371 @@ import pickle
 import struct
 import json
 import time
-import csv
+import os
 
-# ==============================
-# SOCKET UTILS
-# ==============================
 
 def send_json(sock, obj):
-    data = json.dumps(obj).encode()
+    data = json.dumps(obj).encode('utf-8')
     sock.sendall(struct.pack(">I", len(data)) + data)
 
-def recv_json(sock):
-    raw = recv_all(sock, 4)
-    if raw is None:
-        return None
-    size = struct.unpack(">I", raw)[0]
-    data = recv_all(sock, size)
-    if data is None:
-        return None
-    return json.loads(data.decode())
+
+def recv_json(sock, timeout=None):
+    if timeout:
+        sock.settimeout(timeout)
+    try:
+        raw_len = recv_all(sock, 4)
+        if raw_len is None:
+            return None
+        msg_len = struct.unpack(">I", raw_len)[0]
+        data = recv_all(sock, msg_len)
+        if data is None:
+            return None
+        return json.loads(data.decode('utf-8'))
+    finally:
+        if timeout:
+            sock.settimeout(None)
+
 
 def send_arrays(sock, arrays):
-    data = pickle.dumps(arrays)
+    data = pickle.dumps(arrays, protocol=pickle.HIGHEST_PROTOCOL)
     sock.sendall(struct.pack(">I", len(data)) + data)
 
-def recv_arrays(sock):
-    raw = recv_all(sock, 4)
-    if raw is None:
-        return None
-    size = struct.unpack(">I", raw)[0]
-    data = recv_all(sock, size)
-    if data is None:
-        return None
-    return pickle.loads(data)
+
+def recv_arrays(sock, timeout=None):
+    if timeout:
+        sock.settimeout(timeout)
+    try:
+        raw_len = recv_all(sock, 4)
+        if raw_len is None:
+            return None
+        msg_len = struct.unpack(">I", raw_len)[0]
+        data = recv_all(sock, msg_len)
+        if data is None:
+            return None
+        return pickle.loads(data)
+    finally:
+        if timeout:
+            sock.settimeout(None)
+
 
 def recv_all(sock, n):
     data = b''
     while len(data) < n:
-        packet = sock.recv(n-len(data))
+        packet = sock.recv(n - len(data))
         if not packet:
             return None
         data += packet
     return data
 
-# ==============================
-# DATASET (loaded once)
-# ==============================
-
-def load_mnist(train_size):
-    mnist = fetch_openml("mnist_784", version=1, as_frame=False)
-
-    X = mnist.data.astype(np.float32)/255.0
-    y = mnist.target.astype(np.int32)
-
-    onehot = np.zeros((y.size,10))
-    onehot[np.arange(y.size),y]=1
-
-    return X[:train_size], onehot[:train_size], y[:train_size]
 
 # ==============================
-# PARAMETER SERVER
+# MNIST CACHE
 # ==============================
+
+def load_mnist(train_size, cache_file="mnist.pkl"):
+
+    if os.path.exists(cache_file):
+
+        print("Loading MNIST from cache file...")
+
+        with open(cache_file, "rb") as f:
+            X, y, one_hot = pickle.load(f)
+
+    else:
+
+        print("Downloading MNIST dataset...")
+
+        mnist = fetch_openml("mnist_784", version=1, as_frame=False)
+
+        X = mnist.data.astype(np.float32) / 255.0
+        y = mnist.target.astype(np.int32)
+
+        one_hot = np.zeros((y.size, 10))
+        one_hot[np.arange(y.size), y] = 1
+
+        with open(cache_file, "wb") as f:
+            pickle.dump((X, y, one_hot), f)
+
+        print("MNIST saved to cache.")
+
+    return X[:train_size], one_hot[:train_size], y[:train_size]
+
 
 class ParameterServer:
 
-    def __init__(self, host, port, epochs, workers, lr, hidden, train_size):
+    def __init__(self, host, port, epochs,
+                 n_batches, lr, hidden, train_size,
+                 eval_interval=25, n_workers=3):
 
-        self.host=host
-        self.port=port
-        self.epochs=epochs
-        self.n_workers=workers
-        self.lr=lr
+        self.host = host
+        self.port = port
+        self.epochs = epochs
+        self.n_batches = n_batches
+        self.lr = lr
+        self.hidden = hidden
+        self.train_size = train_size
+        self.eval_interval = eval_interval
+        self.n_workers = n_workers
 
-        self.hidden=hidden
-        self.train_size=train_size
+        self.workers = []
+        self.lock = threading.Lock()
+        self.ready_workers = 0
+        self.ready_condition = threading.Condition(self.lock)
 
-        self.workers=[]
-        self.lock=threading.Lock()
+        self.training_started = False
+        self.training_done = False
 
-        print("Loading MNIST...")
-        self.X,self.Y,self.y_raw=load_mnist(train_size)
+        self.server_socket = None
 
-        print("Dataset ready")
+        # MNIST
+        self.X_train, self.Y_train, self.y_train_raw = load_mnist(self.train_size)
 
-        input_size=self.X.shape[1]
+        self.create_batches(self.n_batches)
 
-        self.ws1=np.random.randn(hidden,input_size)*np.sqrt(2./input_size)
-        self.bs1=np.zeros((1,hidden))
+        input_size = self.X_train.shape[1]
+        output_size = 10
 
-        self.ws2=np.random.randn(10,hidden)*np.sqrt(2./hidden)
-        self.bs2=np.zeros((1,10))
+        self.ws1 = np.random.randn(hidden, input_size) * np.sqrt(2. / input_size)
+        self.bs1 = np.zeros((1, hidden))
+        self.ws2 = np.random.randn(output_size, hidden) * np.sqrt(2. / hidden)
+        self.bs2 = np.zeros((1, output_size))
 
-        self.batch_data=np.array_split(self.X,self.n_workers)
-        self.batch_targets=np.array_split(self.Y,self.n_workers)
+    def create_batches(self, n_batches):
+        self.batch_data = np.array_split(self.X_train, n_batches)
+        self.batch_targets = np.array_split(self.Y_train, n_batches)
 
-        # CSV files
-        self.training_csv=f"training_{workers}_workers.csv"
-        self.worker_csv=f"worker_times_{workers}_workers.csv"
+    def create_assignments(self):
 
-        with open(self.training_csv,"w",newline="") as f:
-            writer=csv.writer(f)
-            writer.writerow(["workers","epoch","accuracy","wall_time"])
+        assignments = [[] for _ in range(self.n_workers)]
 
-        with open(self.worker_csv,"w",newline="") as f:
-            writer=csv.writer(f)
-            writer.writerow(["workers","epoch","worker_id","train_time"])
+        for i in range(self.n_batches):
+            assignments[i % self.n_workers].append(i)
 
-    def accuracy(self):
+        return assignments
 
-        z1=self.X.dot(self.ws1.T)+self.bs1
-        a1=np.maximum(0,z1)
+    def send_dataset(self, conn, worker_id, assignments):
 
-        z2=a1.dot(self.ws2.T)+self.bs2
-        pred=np.argmax(z2,axis=1)
+        arrays = {
+            'batch_data': self.batch_data,
+            'batch_targets': self.batch_targets,
+        }
 
-        return np.mean(pred==self.y_raw)*100
+        send_arrays(conn, arrays)
 
-    def start(self):
+        send_json(conn, {
+            "type": "dataset",
+            "n_batches": self.n_batches,
+            "lr": self.lr,
+            "worker_id": worker_id,
+            "assignments": assignments[worker_id]
+        })
 
-        server=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    def compute_accuracy(self):
 
-        server.bind((self.host,self.port))
-        server.listen()
+        z1 = self.X_train.dot(self.ws1.T) + self.bs1
+        a1 = np.maximum(0, z1)
+        z2 = a1.dot(self.ws2.T) + self.bs2
 
-        print("Waiting workers...")
+        predictions = np.argmax(z2, axis=1)
 
-        while len(self.workers)<self.n_workers:
+        accuracy = np.mean(predictions == self.y_train_raw) * 100
 
-            conn,addr=server.accept()
-            worker_id=len(self.workers)
+        return accuracy
 
-            print("Worker connected",addr)
+    def training_loop(self):
 
-            send_arrays(conn,{
-                "batch_data":self.batch_data,
-                "batch_targets":self.batch_targets
-            })
+        with self.ready_condition:
+            while self.ready_workers < self.n_workers:
+                self.ready_condition.wait()
 
-            send_json(conn,{
-                "worker_id":worker_id,
-                "lr":self.lr
-            })
+        self.training_started = True
 
-            self.workers.append(conn)
-
-        print("All workers ready")
-
-        start=time.time()
+        start_time = time.time()
 
         for epoch in range(self.epochs):
 
-            for wid,conn in enumerate(self.workers):
+            with self.lock:
+                workers = list(self.workers)
 
-                send_json(conn,{
-                    "type":"train",
-                    "epoch":epoch,
-                    "measure":epoch%60==0
+            for worker in workers:
+                conn, addr, worker_id, _ = worker
+
+                send_json(conn, {
+                    "type": "train",
+                    "batches": [worker_id],
+                    "lr": self.lr,
+                    "epoch": epoch + 1
                 })
 
-                send_arrays(conn,(self.ws1,self.bs1,self.ws2,self.bs2))
+            for worker in workers:
+                conn, addr, worker_id, _ = worker
+                send_arrays(conn, (self.ws1, self.bs1, self.ws2, self.bs2))
 
-            grads=[]
-            worker_times=[]
+            grads = []
 
-            for wid,conn in enumerate(self.workers):
+            for worker in workers:
 
-                msg=recv_json(conn)
+                conn, addr, worker_id, _ = worker
 
-                if msg["type"]=="grad":
+                worker_grads = recv_arrays(conn, timeout=60.0)
 
-                    grads.extend(recv_arrays(conn))
+                if worker_grads is not None:
+                    grads.extend(worker_grads)
 
-                    if msg["measure"]:
-                        worker_times.append((wid,msg["time"]))
+            if not grads:
+                continue
 
-            avg=[sum(x)/len(grads) for x in zip(*grads)]
+            avg_dw1 = sum(g[0] for g in grads) / len(grads)
+            avg_db1 = sum(g[1] for g in grads) / len(grads)
+            avg_dw2 = sum(g[2] for g in grads) / len(grads)
+            avg_db2 = sum(g[3] for g in grads) / len(grads)
 
-            self.ws1-=self.lr*avg[0]
-            self.bs1-=self.lr*avg[1]
-            self.ws2-=self.lr*avg[2]
-            self.bs2-=self.lr*avg[3]
+            self.ws1 -= self.lr * avg_dw1
+            self.bs1 -= self.lr * avg_db1
+            self.ws2 -= self.lr * avg_dw2
+            self.bs2 -= self.lr * avg_db2
 
-            if epoch%50==0:
+        wall_time = time.time() - start_time
+        final_acc = self.compute_accuracy()
 
-                acc=self.accuracy()
-                wall=time.time()-start
+        print(f"RESULT {self.n_workers} {wall_time} {final_acc}")
 
-                with open(self.training_csv,"a",newline="") as f:
-                    csv.writer(f).writerow(
-                        [self.n_workers,epoch,acc,wall]
-                    )
+        self.training_done = True
 
-                print("Epoch",epoch,"Acc",acc)
+        with self.lock:
+            for worker in self.workers:
+                try:
+                    worker[0].close()
+                except:
+                    pass
 
-            for wid,t in worker_times:
+        try:
+            if self.server_socket:
+                self.server_socket.close()
+        except:
+            pass
 
-                with open(self.worker_csv,"a",newline="") as f:
-                    csv.writer(f).writerow(
-                        [self.n_workers,epoch,wid,t]
-                    )
+    def handle_worker(self, conn, addr):
 
-        total=time.time()-start
-        acc=self.accuracy()
+        accept_worker = False
 
-        print("Training finished")
+        with self.lock:
 
-        with open("experiment_summary.csv","a",newline="") as f:
+            if not self.training_started and len(self.workers) < self.n_workers:
 
-            csv.writer(f).writerow(
-                [self.n_workers,total,acc]
-            )
+                worker_id = len(self.workers)
 
-        for conn in self.workers:
+                self.workers.append([conn, addr, worker_id, []])
 
-            send_json(conn,{"type":"done"})
+                accept_worker = True
+
+        if not accept_worker:
+
+            try:
+                send_json(conn, {"type": "reject"})
+            except:
+                pass
+
             conn.close()
+            return
+
+        assignments = self.create_assignments()
+
+        self.send_dataset(conn, worker_id, assignments)
+
+        response = recv_json(conn, timeout=30.0)
+
+        if response is None or response.get("status") != "ready":
+            conn.close()
+            return
+
+        with self.ready_condition:
+
+            self.ready_workers += 1
+
+            if self.ready_workers >= self.n_workers:
+                self.ready_condition.notify_all()
+
+        while not self.training_done:
+            time.sleep(0.1)
+
+    def start(self):
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        server.bind((self.host, self.port))
+
+        server.listen()
+
+        self.server_socket = server
+
+        print(f"Parameter server listening on {self.host}:{self.port}")
+        print(f"Waiting for {self.n_workers} workers...")
+
+        threading.Thread(target=self.training_loop, daemon=True).start()
+
+        while not self.training_done:
+
+            try:
+                server.settimeout(1.0)
+                conn, addr = server.accept()
+
+            except socket.timeout:
+                continue
+
+            except OSError:
+                break
+
+            with self.lock:
+
+                if len(self.workers) >= self.n_workers:
+
+                    try:
+                        send_json(conn, {"type": "reject"})
+                    except:
+                        pass
+
+                    conn.close()
+                    continue
+
+            threading.Thread(
+                target=self.handle_worker,
+                args=(conn, addr),
+                daemon=True
+            ).start()
+
+        print("Training finished. Server shutting down.")
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
 
-    parser=argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Distributed Parameter Server")
 
-    parser.add_argument("--host",default="0.0.0.0")
-    parser.add_argument("--port",type=int,default=5000)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--epochs", type=int, default=600)
+    parser.add_argument("--n_batches", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--hidden", type=int, default=50)
+    parser.add_argument("--train_size", type=int, default=60000)
+    parser.add_argument("--n_workers", type=int, default=3)
 
-    parser.add_argument("--workers",type=int,default=4)
-    parser.add_argument("--epochs",type=int,default=600)
+    args = parser.parse_args()
 
-    parser.add_argument("--lr",type=float,default=0.05)
-    parser.add_argument("--hidden",type=int,default=50)
-    parser.add_argument("--train_size",type=int,default=60000)
+    if args.n_batches is None:
+        args.n_batches = args.n_workers
 
-    args=parser.parse_args()
-
-    ps=ParameterServer(
-        args.host,
-        args.port,
-        args.epochs,
-        args.workers,
-        args.lr,
-        args.hidden,
-        args.train_size
+    ps = ParameterServer(
+        host=args.host,
+        port=args.port,
+        epochs=args.epochs,
+        n_batches=args.n_batches,
+        lr=args.lr,
+        hidden=args.hidden,
+        train_size=args.train_size,
+        n_workers=args.n_workers
     )
 
     ps.start()
